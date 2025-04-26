@@ -27,6 +27,7 @@ from math_verify import LatexExtractionConfig, parse, verify
 
 from .utils import is_e2b_available
 from .utils.ioi import SubtaskResult, add_includes, get_piston_client_from_env, score_subtask
+from .utils.codeforces import get_piston_client_from_env as get_cf_piston_client_from_env, patch_code as cf_patch_code, score_submission as cf_score_submission
 
 
 if is_e2b_available():
@@ -377,6 +378,45 @@ def ioi_code_reward(completions, test_batch_size: int = 1, **kwargs) -> list[flo
     return [result.score for result in results]
 
 
+def cf_code_reward(completions, test_batch_size: int = 1, language: str = "cpp", patch_code: bool = False, partial_scoring: bool = False, **kwargs) -> list[float]:
+    """Reward function that evaluates Codeforces problems using Piston+our CF package.
+
+    Assumes the dataset has the same format as hf.co/datasets/open-r1/codeforces-verifiable
+
+    test_batch_size: evaluate these many test cases in parallel, then check if any of them failed (0 score): if so stop evaluating; otherwise continue with the next batch of test cases.
+    """
+    # for info on setting up piston workers, see slurm/piston/README.md
+    piston_client = get_cf_piston_client_from_env()
+
+    patch_code = False
+    code_snippets = [
+        # note: grading is automatically skipped if no code is extracted
+        cf_patch_code(extract_code(completion[-1]["content"], language), language) if patch_code else extract_code(completion[-1]["content"], language)
+        for completion in completions
+    ]
+
+    async def run_catch_exceptions(task):
+        try:
+            return await task
+        except Exception as e:
+            print(f"Error from Piston worker: {e}")
+            return 0.0
+
+    # load problem data. undo separating kwargs by column
+    problems_data = [dict(zip(kwargs.keys(), values)) for values in zip(*kwargs.values())]
+
+    loop = _init_event_loop()
+    evals = [
+        loop.create_task(
+            run_catch_exceptions(cf_score_submission(piston_client, problem_data, code, test_batch_size=test_batch_size, partial_scoring=partial_scoring))
+        )
+        for problem_data, code in zip(problems_data, code_snippets)
+    ]
+    results = loop.run_until_complete(asyncio.gather(*evals))
+
+    return results
+
+
 def extract_code(completion: str, language: str = "python") -> str:
     pattern = re.compile(rf"```{language}\n(.*?)```", re.DOTALL)
     matches = pattern.findall(completion)
@@ -598,6 +638,9 @@ def get_reward_funcs(script_args) -> list[Callable]:
         ),
         "ioi_code": update_wrapper(
             partial(ioi_code_reward, test_batch_size=script_args.code_eval_test_batch_size), ioi_code_reward
+        ),
+        "cf_code": update_wrapper(
+            partial(cf_code_reward, test_batch_size=script_args.code_eval_test_batch_size, language=script_args.code_language, partial_scoring=script_args.code_eval_partial_grading), cf_code_reward
         ),
         "code_format": get_code_format_reward(language=script_args.code_language),
         "tag_count": tag_count_reward,
